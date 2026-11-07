@@ -36,6 +36,21 @@ except ImportError:  # pragma: no cover
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RULES_PATH = REPO_ROOT / "config" / "toolchain-rules.yaml"
 
+# NDK versions the prebuilt Docker image (Dockerfile.android) ships with.
+# Keep in sync with the `sdkmanager "ndk;..."` list there.
+# Order of discovery in pick_ndk_version():
+#   1. detection.json's versions.ndk_version (detect_project.py's best guess)
+#   2. direct scan of build.gradle(.kts) for ndkVersion "X" (defence in depth —
+#      detect sometimes misses the un-equals form `ndkVersion "X"`)
+#   3. DEFAULT_NDK_VERSION below
+# All fallbacks land on an image-baked version so the workflow never has to
+# install NDK at runtime (which costs ~4-5 min per build).
+KNOWN_NDK_VERSIONS = {
+    "25.2.9519653",   # modern default — handles paths with spaces in ndkBuild
+    "21.4.7075529",   # legacy fallback for projects that hard-pin it
+}
+DEFAULT_NDK_VERSION = "25.2.9519653"
+
 
 def load_rules(path: Path | None = None) -> dict[str, Any]:
     p = path or RULES_PATH
@@ -70,7 +85,6 @@ def pick_jdk_for_agp(agp: str | None, rules: dict) -> str:
         return "11"
     if m <= 3:
         return "8"
-    # Fallback to version-catalog rules
     for pattern, jdk in rules.get("agp_to_jdk", {}).items():
         if pattern.endswith(".x"):
             pm = pattern[:-2]
@@ -99,16 +113,13 @@ def pick_gradle_for_agp(agp: str | None, rules: dict) -> str | None:
     if not agp:
         return None
     mapping = rules.get("agp_to_gradle", {})
-    # Try exact match first
     if agp in mapping:
         return mapping[agp]
-    # Try prefix match (e.g. "7.4.2" → "7.4")
     parts = str(agp).split(".")
     for i in range(len(parts), 0, -1):
         prefix = ".".join(parts[:i])
         if prefix in mapping:
             return mapping[prefix]
-    # Fall back to major-version scan
     m = major(agp)
     for k, v in mapping.items():
         if major(k) == m:
@@ -126,11 +137,53 @@ def pick_flutter_version(detect: dict, rules: dict) -> str:
     return str(rules.get("flutter", {}).get("default_version", "3.24.0"))
 
 
-def pick_ndk_version(detect: dict, rules: dict) -> str:
+def _scan_pinned_ndk(project_root: Path) -> str | None:
+    """Scan every build.gradle(.kts) for an `ndkVersion` declaration.
+
+    Covers both assignment forms:
+        android { ndkVersion "25.2.9519653" }          # Groovy, no equals
+        android { ndkVersion = "25.2.9519653" }        # Groovy/Kotlin, equals
+    Returns the first match, or None if no project file declares one.
+    """
+    patterns = [
+        re.compile(r'ndkVersion\s*=\s*["\']([\d.]+)["\']'),
+        re.compile(r'ndkVersion\s+["\']([\d.]+)["\']'),
+    ]
+    for gradle_file in project_root.rglob("build.gradle*"):
+        try:
+            text = gradle_file.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for pat in patterns:
+            m = pat.search(text)
+            if m:
+                return m.group(1)
+    return None
+
+
+def pick_ndk_version(detect: dict, rules: dict) -> tuple[str, str]:
+    """Return (version, source).
+
+    source is a short human-readable label so the build log shows exactly
+    why a specific NDK was chosen. Anything other than 'image' means the
+    workflow will have to `sdkmanager install` that NDK at runtime, so we
+    want it visible in the toolchain JSON.
+    """
+    # 1. detect_project.py's best guess
     ndk_v = (detect.get("versions") or {}).get("ndk_version")
     if ndk_v:
-        return str(ndk_v)
-    return str(rules.get("ndk", {}).get("default_version", "26.1.10909125"))
+        return str(ndk_v), "detection.json"
+
+    # 2. defence-in-depth: scan build.gradle ourselves (covers the case
+    # where detect_project.py missed the un-equals `ndkVersion "X"` form)
+    root = detect.get("project_root")
+    if root:
+        pinned = _scan_pinned_ndk(Path(root))
+        if pinned:
+            return pinned, "build.gradle (scanned)"
+
+    # 3. image-baked default (never triggers a runtime install)
+    return DEFAULT_NDK_VERSION, "image default"
 
 
 def determine_legacy_fixes(detect: dict, rules: dict) -> list[dict]:
@@ -179,26 +232,9 @@ def apply_fixes(detect: dict, fixes: list[dict], android_sdk_root: str) -> list[
                     f.write("\n# AndroidForge: disable Gradle daemon for old Gradle\norg.gradle.daemon=false\n")
                 applied.append("Disabled Gradle daemon via gradle.properties")
         elif name == "patch_gradle_wrapper":
-            # The workflow will run `gradle wrapper` to regenerate; we just flag it.
             applied.append("Flagged wrapper for regeneration via `gradle wrapper`")
 
-    # ---- Always ensure gradle.properties has a reasonable JVM heap ----
-    # The GitHub-hosted ubuntu-latest runner has ~7 GB RAM. The Gradle
-    # daemon's default heap is often too small for Flutter / multi-module
-    # projects, leading to "Gradle build daemon has been stopped: since
-    # the JVM garbage collector is thrashing" during flutter build apk.
-    # We inject `org.gradle.jvmargs=-Xmx4g` in THREE places:
-    #   1. <project_root>/gradle.properties  (root-level, for plain Gradle projects)
-    #   2. <project_root>/android/gradle.properties  (Flutter projects invoke Gradle from android/)
-    #   3. ~/.gradle/gradle.properties  (global, applies to ALL Gradle invocations)
     HEAP_LINE = "org.gradle.jvmargs=-Xmx4g -XX:+UseG1GC -Dfile.encoding=UTF-8"
-    # AndroidX is required by most modern Flutter plugins. If a project
-    # doesn't enable it explicitly, Gradle aborts with:
-    #   "Configuration :app:debugRuntimeClasspath contains AndroidX
-    #    dependencies, but the android.useAndroidX property is not enabled."
-    # We proactively set useAndroidX=true + enableJetifier=true so legacy
-    # support-library references are auto-migrated. Both flags are no-ops
-    # for projects that already use AndroidX, so this is safe to set always.
     ANDROIDX_LINES = [
         "android.useAndroidX=true",
         "android.enableJetifier=true",
@@ -208,7 +244,6 @@ def apply_fixes(detect: dict, fixes: list[dict], android_sdk_root: str) -> list[
         if props_path.exists():
             content = props_path.read_text(encoding="utf-8", errors="replace")
             changes: list[str] = []
-            # Handle jvmargs
             m = re.search(r"^org\.gradle\.jvmargs\s*=\s*(.+)$", content, re.MULTILINE)
             if m:
                 existing = m.group(1).strip()
@@ -227,11 +262,9 @@ def apply_fixes(detect: dict, fixes: list[dict], android_sdk_root: str) -> list[
                         if new_content != content:
                             content = new_content
                             changes.append(f"bumped jvmargs from '{existing}'")
-                # else: heap is already >= 4g, leave alone
             else:
                 content += f"\n# AndroidForge: ensure enough heap for the Gradle daemon\n{HEAP_LINE}\n"
                 changes.append("added jvmargs")
-            # Handle android.useAndroidX
             if not re.search(r"^android\.useAndroidX\s*=", content, re.MULTILINE):
                 content += f"\n# AndroidForge: enable AndroidX (most Flutter plugins need it)\n"
                 for line in ANDROIDX_LINES:
@@ -253,27 +286,15 @@ def apply_fixes(detect: dict, fixes: list[dict], android_sdk_root: str) -> list[
             props_path.write_text(content)
             applied.append(f"Created {location_label} with jvmargs + useAndroidX + enableJetifier")
 
-    # 1. Project root gradle.properties
     _inject_gradle_properties(root / "gradle.properties", "gradle.properties (root)")
-    # 2. For Flutter projects: android/gradle.properties (this is the one
-    #    Gradle actually reads when invoked from the android/ subdir).
     android_dir = root / "android"
     if android_dir.is_dir():
         _inject_gradle_properties(android_dir / "gradle.properties", "android/gradle.properties (Flutter)")
-    # 3. Global gradle.properties in the user's home — applies to ALL
-    #    Gradle invocations on the runner regardless of project.
     home_gradle = Path.home() / ".gradle" / "gradle.properties"
     _inject_gradle_properties(home_gradle, "~/.gradle/gradle.properties (global)")
 
-    # ---- Inject common public Maven repos (JitPack, Google, mavenCentral) ----
-    # Many projects (especially Flutter plugins) depend on libraries hosted
-    # on JitPack (group ID starts with 'com.github.'). If the project's
-    # build.gradle / settings.gradle doesn't declare the JitPack repo, the
-    # build fails with "Could not find com.github.foo:bar:x.y.z".
-    # We proactively inject these repos into the project's gradle files.
     _inject_repositories(root, applied, is_flutter=bool((detect.get("flutter") or {}).get("is_flutter")))
 
-    # Always disable build cache & parallel for very old gradle (safer)
     return applied
 
 
@@ -290,9 +311,6 @@ def _inject_repositories(root: Path, applied: list[str], is_flutter: bool) -> No
       "Build was configured to prefer settings repositories over project
        repositories but repository 'maven' was added by build file 'build.gradle'"
     """
-    # First, scan all settings.gradle files for RepositoriesMode declarations.
-    # If any of them use FAIL_ON_PROJECT_REPOS or PREFER_SETTINGS, we MUST NOT
-    # inject into any build.gradle file.
     settings_files = [
         root / "settings.gradle",
         root / "settings.gradle.kts",
@@ -308,8 +326,6 @@ def _inject_repositories(root: Path, applied: list[str], is_flutter: bool) -> No
             forbid_project_repos = True
             break
 
-    # Build the candidate list. If the project forbids project-level repos,
-    # we restrict to settings.gradle files only.
     candidates: list[Path] = []
     if is_flutter:
         candidates = [
@@ -324,7 +340,6 @@ def _inject_repositories(root: Path, applied: list[str], is_flutter: bool) -> No
         root / "settings.gradle",
         root / "settings.gradle.kts",
     ]
-    # If the project forbids project-level repos, filter out build.gradle files.
     if forbid_project_repos:
         candidates = [c for c in candidates if not c.name.startswith("build.gradle")]
 
@@ -345,7 +360,6 @@ def _inject_repositories(root: Path, applied: list[str], is_flutter: bool) -> No
         if not grad.exists():
             continue
         content = grad.read_text(encoding="utf-8", errors="replace")
-        # Skip if all repos are already declared anywhere in the file.
         already_has = (
             "jitpack.io" in content
             and "maven.google.com" in content
@@ -353,21 +367,13 @@ def _inject_repositories(root: Path, applied: list[str], is_flutter: bool) -> No
         )
         if already_has:
             continue
-        # Try to find a `repositories { ... }` block and append our repos
-        # just before its closing brace.
         is_kts = grad.name.endswith(".kts")
         repo_lines = REPO_LINES_KTS if is_kts else REPO_LINES_GROOVY
-        # Process matches in REVERSE order so earlier insertions don't
-        # invalidate the close_idx of later matches. (Each insertion shifts
-        # content after it; processing from end→start keeps earlier indices
-        # valid.)
         matches = list(re.finditer(r"repositories\s*\{", content, re.IGNORECASE))
         matches.reverse()
         new_content = content
         injected = False
         for m in matches:
-            # Find the matching closing brace by counting, starting from
-            # the end of the 'repositories {' match.
             start = m.end()
             depth = 1
             i = start
@@ -381,7 +387,6 @@ def _inject_repositories(root: Path, applied: list[str], is_flutter: bool) -> No
             if depth != 0:
                 continue
             close_idx = i - 1
-            # Check which repos are missing from THIS block.
             block_content = new_content[start:close_idx]
             missing = []
             for line, marker in zip(repo_lines, ["maven.google.com", "mavenCentral()", "plugins.gradle.org", "jitpack.io"]):
@@ -390,15 +395,9 @@ def _inject_repositories(root: Path, applied: list[str], is_flutter: bool) -> No
             if not missing:
                 continue
             inject_text = "\n        // AndroidForge: ensure common public Maven repos\n        " + "\n        ".join(missing) + "\n"
-            # Insert just before the closing brace of this block.
             new_content = new_content[:close_idx] + inject_text + new_content[close_idx:]
             injected = True
         if not injected and not forbid_project_repos:
-            # Strategy 2: append a top-level allprojects block.
-            # ONLY do this if the project doesn't forbid project-level repos
-            # (otherwise we'd cause the same FAIL_ON_PROJECT_REPOS conflict).
-            # Also, allprojects {} is invalid in settings.gradle — only
-            # append to build.gradle files.
             if grad.name.startswith("build.gradle"):
                 block = "\n\n// AndroidForge: ensure common public Maven repos\nallprojects {\n    repositories {\n"
                 for line in repo_lines:
@@ -422,7 +421,6 @@ def main() -> int:
 
     rules = load_rules(Path(args.rules) if args.rules else None)
 
-    # Parse detection JSON
     if Path(args.detect).exists():
         detect = json.loads(Path(args.detect).read_text())
     else:
@@ -438,43 +436,37 @@ def main() -> int:
     # Pick JDK
     jdk_from_agp = pick_jdk_for_agp(agp, rules)
     jdk_from_gradle = pick_jdk_for_gradle(gradle_wrapper_v, rules)
-    # Use the highest of (agp req, gradle req, project's own target)
     jdk_candidates = [jdk_from_agp, jdk_from_gradle]
     if java_in_build:
         jdk_candidates.append(str(java_in_build))
     chosen_jdk = max(jdk_candidates, key=lambda v: (major(v), minor(v)))
 
     # Pick Gradle
-    chosen_gradle = gradle_wrapper_v  # prefer the bundled wrapper version
+    chosen_gradle = gradle_wrapper_v
     if not chosen_gradle:
         chosen_gradle = pick_gradle_for_agp(agp, rules)
     if not chosen_gradle:
-        chosen_gradle = "8.0"  # safe modern fallback
+        chosen_gradle = "8.0"
 
-    # Determine if wrapper can be used
     use_wrapper = bool(wrapper.get("present"))
     if wrapper.get("uses_http"):
-        # We can fix it; still usable
         use_wrapper = True
 
     # Pick Flutter
     needs_flutter = bool((detect.get("flutter") or {}).get("is_flutter"))
     chosen_flutter = pick_flutter_version(detect, rules) if needs_flutter else None
 
-    # Pick NDK
+    # Pick NDK — returns (version, source_label)
     needs_ndk = bool((detect.get("native") or {}).get("has_native"))
-    chosen_ndk = pick_ndk_version(detect, rules) if needs_ndk else None
+    if needs_ndk:
+        chosen_ndk, ndk_source = pick_ndk_version(detect, rules)
+    else:
+        chosen_ndk, ndk_source = None, None
 
     # Determine legacy fixes
     fixes = determine_legacy_fixes(detect, rules)
     applied_fixes = apply_fixes(detect, fixes, args.android_sdk)
 
-    # Decide build commands. Prep commands run unconditionally first (e.g.
-    # `flutter pub get` to download dependencies); build commands are tried
-    # in order and the first one to succeed marks the build as successful.
-    # Prep commands must NOT be in build_commands — otherwise build_project.py
-    # would stop on `flutter pub get` (which exits 0 without producing an APK)
-    # and never actually run `flutter build apk`.
     prep_commands: list[list[str]] = []
     if needs_flutter:
         prep_commands = [["flutter", "pub", "get"]]
@@ -483,7 +475,6 @@ def main() -> int:
             ["flutter", "build", "apk", "--release"],
         ]
     else:
-        # Use gradlew if present, otherwise use installed gradle
         gradlew = Path(detect["project_root"]) / "gradlew"
         gradle_cmd = str(gradlew) if use_wrapper and gradlew.exists() else "gradle"
         build_commands = [
@@ -499,6 +490,7 @@ def main() -> int:
         "agp_version": agp,
         "kotlin_version": kotlin_v,
         "ndk_version": chosen_ndk,
+        "ndk_source": ndk_source,
         "flutter_version": chosen_flutter,
         "use_gradle_wrapper": use_wrapper,
         "needs_flutter": needs_flutter,
@@ -509,14 +501,12 @@ def main() -> int:
         "build_commands": build_commands,
     }
 
-    # Output JSON
     output = json.dumps(result, indent=2)
     if args.output:
         Path(args.output).write_text(output)
     else:
         print(output)
 
-    # Write to GITHUB_OUTPUT
     gh_output = os.environ.get("GITHUB_OUTPUT")
     if gh_output:
         with open(gh_output, "a", encoding="utf-8") as f:
@@ -528,6 +518,8 @@ def main() -> int:
                 f.write(f"kotlin_version={kotlin_v}\n")
             if chosen_ndk:
                 f.write(f"ndk_version={chosen_ndk}\n")
+                if ndk_source:
+                    f.write(f"ndk_source={ndk_source}\n")
             f.write(f"needs_flutter={'true' if needs_flutter else 'false'}\n")
             f.write(f"needs_ndk={'true' if needs_ndk else 'false'}\n")
             f.write(f"needs_gradle={'true' if result['needs_gradle'] else 'false'}\n")
