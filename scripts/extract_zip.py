@@ -4,15 +4,26 @@
 Extracts the source ZIP to a clean workspace and writes the extracted root
 directory to $GITHUB_OUTPUT.
 
-The script strips macOS metadata directories (`__MACOSX`) and unwraps a
+The script strips macOS metadata directories (`__MACOSX`), unwraps a
 top-level single directory if present (so e.g. `MyProject-1.2.3/` becomes
-the workspace root when it's the only top-level entry).
+the workspace root when it's the only top-level entry), and sanitizes the
+final project-root directory name so it contains no spaces.
+
+Why sanitize spaces:
+    The Android NDK (r21 and earlier, still pinned by some legacy projects)
+    runs `ndk-build` with $APP_BUILD_SCRIPT unquoted. A path like
+    `/work/.androidforge/workspace/ImGui dump 64/app/src/main/jni/Android.mk`
+    splits into multiple make targets at the space, producing:
+        Android NDK: Your APP_BUILD_SCRIPT points to an unknown file: ...
+    Newer NDK (r25+) handles spaces correctly, but the rename is cheap
+    defence-in-depth and also keeps log paths machine-parseable.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import re
 import shutil
 import sys
 import zipfile
@@ -21,6 +32,43 @@ from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def safe_dirname(name: str) -> str:
+    """Collapse anything non-alnum/._- to underscore.
+
+    Example: 'ImGui dump 64' → 'ImGui_dump_64'.
+    Empty result is replaced with 'project'.
+    Long names are capped at 80 chars to keep the final path within
+    PATH_MAX when combined with deep extraction roots.
+    """
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._-")
+    if len(cleaned) > 80:
+        cleaned = cleaned[:80].rstrip("._-")
+    return cleaned or "project"
+
+
+def _sanitize_top_level(top: Path) -> Path:
+    """Rename a top-level directory if its name contains unsafe characters.
+
+    Returns the (possibly new) path. If the name is already safe, the
+    original path is returned unchanged.
+    """
+    safe = safe_dirname(top.name)
+    if safe == top.name:
+        return top
+    new = top.parent / safe
+    # Collision guard: if a same-named entry already exists, append a suffix.
+    if new.exists():
+        i = 2
+        while True:
+            candidate = top.parent / f"{safe}_{i}"
+            if not candidate.exists():
+                new = candidate
+                break
+            i += 1
+    top.rename(new)
+    return new
 
 
 def extract(zip_path: Path, dest_dir: Path) -> Path:
@@ -50,10 +98,16 @@ def extract(zip_path: Path, dest_dir: Path) -> Path:
             except Exception:
                 pass
 
-    # If the archive contains exactly one top-level directory, return that.
+    # If the archive contains exactly one top-level directory, unwrap it
+    # AND sanitize its name (spaces → underscores) so downstream tools —
+    # especially legacy Android NDK r21 — never see a path with spaces.
     top = [p for p in dest_dir.iterdir() if not p.name.startswith(".")]
     if len(top) == 1 and top[0].is_dir():
-        return top[0]
+        return _sanitize_top_level(top[0])
+
+    # Multiple top-level entries: project_root is dest_dir itself.
+    # dest_dir is derived from a repo-controlled path (.androidforge/workspace),
+    # so it's already safe — nothing to sanitize here.
     return dest_dir
 
 
@@ -80,6 +134,7 @@ def main() -> int:
         "zip_path": str(zip_path),
         "extract_root": str(project_root),
         "dest_dir": str(dest_dir),
+        "path_had_spaces": " " in str(project_root),
     }, indent=2))
 
     gh_output = os.environ.get("GITHUB_OUTPUT")
